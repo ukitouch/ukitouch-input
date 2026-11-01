@@ -1,0 +1,20 @@
+[package]
+name = "ukitouch-input"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "input"
+path = "src/mod.rs"
+
+[[bin]]
+name = "ukitouch-input"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.14", features = ["xtest"] }
