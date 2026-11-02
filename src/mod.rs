@@ -39,10 +39,23 @@ pub enum InputEvent {
     Text { text: String },
 }
 
+/// Input options from the host.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InputOptions {
+    /// Apply spring smooth to the pointer's motion.
+    pub smooth: bool,
+}
+
 /// The whole backend of input, handles all input events into clicks.
 pub trait InputBackend: Send {
     /// Handle a batch of events.
     fn handle(&mut self, events: &[InputEvent]) -> Result<(), String>;
+
+    /// Apply options.
+    fn configure(&mut self, _options: &InputOptions) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Release everything this backend is holding down.
     fn release(&mut self);
@@ -62,4 +75,3 @@ pub fn create() -> Result<Box<dyn InputBackend>, String> {
 
 #[cfg(all(unix, not(target_os = "android")))]
 pub mod x11;
-

@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use input::{create, InputBackend, InputEvent};
+use input::{create, InputBackend, InputEvent, InputOptions};
 
 /// The backend, kept alive across command calls.
 #[derive(Default)]
@@ -14,6 +14,17 @@ struct State(Mutex<Option<Box<dyn InputBackend>>>);
 #[derive(Deserialize)]
 struct Inject {
     events: Vec<InputEvent>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct StartInput {
+    options: InputOptions,
+}
+
+#[derive(Deserialize)]
+struct ConfigureInput {
+    options: InputOptions,
 }
 
 #[tokio::main]
@@ -44,16 +55,25 @@ async fn main() {
 fn dispatch(state: &State, method: &str, payload: Value) -> Result<Value, String> {
     match method {
         "input_start" => {
+            let args: Option<StartInput> = serde_json::from_value(payload).map_err(|e| e.to_string())?;
+            let options = args.map(|a| a.options).unwrap_or_default();
             let mut held = state.0.lock().unwrap();
             if held.is_none() {
                 *held = Some(create()?);
             }
+            held.as_mut().unwrap().configure(&options)?;
+            Ok(Value::Null)
+        }
+        "input_configure" => {
+            let ConfigureInput { options } = serde_json::from_value(payload).map_err(|e| e.to_string())?;
+            let mut held = state.0.lock().unwrap();
+            held.as_mut().ok_or("input backend not connected")?.configure(&options)?;
             Ok(Value::Null)
         }
         "input_inject" => {
             let Inject { events } = serde_json::from_value(payload).map_err(|e| e.to_string())?;
             let mut held = state.0.lock().unwrap();
-            let backend = held.as_mut().ok_or("input not started")?;
+            let backend = held.as_mut().ok_or("input backend not connected")?;
             backend.handle(&events)?;
             Ok(Value::Null)
         }

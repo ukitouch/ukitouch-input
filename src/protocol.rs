@@ -45,6 +45,7 @@ pub fn stdout() -> Out {
 pub async fn register(out: &Out) {
     let capabilities = [
         "input_start",
+        "input_configure",
         "input_inject",
         "input_release",
         "input_stop",

@@ -1,15 +1,18 @@
 use std::collections::HashMap;
-use std::thread::sleep;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{sleep, JoinHandle};
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
-use super::{InputBackend, InputEvent, MouseButton};
+use super::{InputBackend, InputEvent, InputOptions, MouseButton};
 
 // Fake input's `type_`.
 const KEY_PRESS: u8 = 2;
@@ -38,6 +41,8 @@ pub struct X11Input {
     buttons: Vec<u8>,
     /// Keys currently down.
     keys: Vec<u8>,
+    /// Easing pointer motion.
+    glide: Option<Glide>,
 }
 
 impl X11Input {
@@ -61,6 +66,7 @@ impl X11Input {
             scratch,
             buttons: Vec::new(),
             keys: Vec::new(),
+            glide: None,
         })
     }
 
@@ -74,8 +80,37 @@ impl X11Input {
     }
 
     /// Move the mouse to `(x, y)`.
-    fn move_to(&mut self, x: i16, y: i16) -> Result<(), String> {
-        self.fake(MOTION_NOTIFY, 0, x, y)
+    ///
+    /// `smooth` applys spring smooth to the pointer motion
+    fn move_to(&mut self, x: i16, y: i16, smooth: bool) -> Result<(), String> {
+        let Some(glide) = self.glide.as_ref() else {
+            return self.fake(MOTION_NOTIFY, 0, x, y);
+        };
+
+        let mut p = glide.state.lock().unwrap();
+        p.target = (x, y);
+
+        if smooth {
+            return Ok(());
+        }
+
+        p.pos = (x, y);
+        self.conn
+            .xtest_fake_input(MOTION_NOTIFY, 0, x11rb::CURRENT_TIME, self.root, x, y, 0)
+            .map(|_| ())
+            .map_err(|e| format!("fake input: {e}"))?;
+        self.conn.flush().map_err(|e| format!("flush: {e}"))
+    }
+
+    /// The position of the pointer on the root window.
+    fn pointer(&self) -> Result<(i16, i16), String> {
+        let reply = self
+            .conn
+            .query_pointer(self.root)
+            .map_err(|e| format!("pointer: {e}"))?
+            .reply()
+            .map_err(|e| format!("pointer: {e}"))?;
+        Ok((reply.root_x, reply.root_y))
     }
 
     /// Turn `notches` into wheel clicks.
@@ -128,14 +163,14 @@ impl InputBackend for X11Input {
     fn handle(&mut self, events: &[InputEvent]) -> Result<(), String> {
         for event in events {
             match event {
-                InputEvent::Move { x, y } => self.move_to(*x, *y)?,
+                InputEvent::Move { x, y } => self.move_to(*x, *y, true)?,
                 InputEvent::Button {
                     at,
                     button,
                     pressed,
                 } => {
                     if let Some(p) = *at {
-                        self.move_to(p.x, p.y)?;
+                        self.move_to(p.x, p.y, false)?;
                     }
                     let code = mouse_code_of(*button);
                     let type_ = if *pressed {
@@ -148,7 +183,7 @@ impl InputBackend for X11Input {
                 }
                 InputEvent::Scroll { at, dx, dy } => {
                     if let Some(p) = *at {
-                        self.move_to(p.x, p.y)?;
+                        self.move_to(p.x, p.y, false)?;
                     }
                     self.wheel(WHEEL_UP, -*dy)?;
                     self.wheel(WHEEL_DOWN, *dy)?;
@@ -168,6 +203,24 @@ impl InputBackend for X11Input {
             }
         }
         self.conn.flush().map_err(|e| format!("flush: {e}"))
+    }
+
+    fn configure(&mut self, options: &InputOptions) -> Result<(), String> {
+        if options.smooth == self.glide.is_some() {
+            return Ok(());
+        }
+
+        self.glide = None;
+        if !options.smooth {
+            return Ok(());
+        }
+
+        let Some(tick) = frame(&self.conn, self.root) else {
+            return Err("no frame rate to ease against".into());
+        };
+        let pos = self.pointer()?;
+        self.glide = Some(Glide::start(self.root, tick, pos));
+        Ok(())
     }
 
     fn release(&mut self) {
@@ -299,6 +352,120 @@ fn keysym_of(ch: char) -> u32 {
         c
     } else {
         c | 0x0100_0000
+    }
+}
+
+/// One step to move a `delta`.
+fn step(delta: i16, f: f64) -> i16 {
+    match (delta as f64 * f).round() as i16 {
+        0 if delta != 0 => delta.signum(),
+        s => s,
+    }
+}
+
+/// One frame, from the mode driving the fastest enabled CRTC.
+fn frame(conn: &RustConnection, root: Window) -> Option<Duration> {
+    let resources = conn.randr_get_screen_resources(root).ok()?.reply().ok()?;
+    let mut fastest = 0.0_f64;
+
+    for &crtc in &resources.crtcs {
+        let Ok(cookie) = conn.randr_get_crtc_info(crtc, x11rb::CURRENT_TIME) else {
+            continue;
+        };
+        let Ok(info) = cookie.reply() else {
+            continue;
+        };
+        // A disabled CRTC has no mode, and no mode id is 0.
+        let Some(mode) = resources.modes.iter().find(|m| m.id == info.mode) else {
+            continue;
+        };
+
+        let lines = mode.htotal as f64 * mode.vtotal as f64;
+        let hz = mode.dot_clock as f64 / lines;
+        if lines > 0.0 && hz.is_finite() && hz > fastest {
+            fastest = hz;
+        }
+    }
+
+    (fastest > 0.0).then(|| Duration::from_secs_f64(1.0 / fastest))
+}
+
+/// A pointer position and the target it's easing towards.
+struct Pointer {
+    pos: (i16, i16),
+    target: (i16, i16),
+}
+
+/// A thread easing the pointer towards each new target.
+struct Glide {
+    state: Arc<Mutex<Pointer>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Glide {
+    fn start(root: Window, tick: Duration, pos: (i16, i16)) -> Self {
+        let state = Arc::new(Mutex::new(Pointer { pos, target: pos }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let state = state.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || ease(root, tick, state, stop))
+        };
+
+        Self {
+            state,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Glide {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Step the pointer towards its target once per frame.
+fn ease(root: Window, tick: Duration, state: Arc<Mutex<Pointer>>, stop: Arc<AtomicBool>) {
+    let Ok((conn, _)) = x11rb::connect(None) else {
+        eprintln!("ease: no connection");
+        return;
+    };
+    let mut last = Instant::now();
+
+    while !stop.load(Ordering::Relaxed) {
+        sleep(tick);
+        let now = Instant::now();
+        // A stalled thread must not make the pointer jump.
+        let dt = (now - last).min(tick);
+        last = now;
+
+        let mut p = state.lock().unwrap();
+        let (dx, dy) = (p.target.0 - p.pos.0, p.target.1 - p.pos.1);
+        if dx == 0 && dy == 0 {
+            continue;
+        }
+
+        let f = 1.0 - (-(dt.as_secs_f64() / TYPE_DELAY.as_secs_f64())).exp();
+        p.pos = (p.pos.0 + step(dx, f), p.pos.1 + step(dy, f));
+        let _ = conn
+            .xtest_fake_input(
+                MOTION_NOTIFY,
+                0,
+                x11rb::CURRENT_TIME,
+                root,
+                p.pos.0,
+                p.pos.1,
+                0,
+            )
+            .map(|_| ())
+            .map_err(|e| format!("fake input: {e}"));
+        let _ = conn.flush();
     }
 }
 
