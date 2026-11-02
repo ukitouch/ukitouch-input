@@ -41,7 +41,7 @@ pub struct X11Input {
     buttons: Vec<u8>,
     /// Keys currently down.
     keys: Vec<u8>,
-    /// Easing pointer motion.
+    /// Spring-smooth pointer motion.
     glide: Option<Glide>,
 }
 
@@ -81,25 +81,28 @@ impl X11Input {
 
     /// Move the mouse to `(x, y)`.
     ///
-    /// `smooth` applys spring smooth to the pointer motion
+    /// `smooth` applies spring smooth to the pointer motion.
     fn move_to(&mut self, x: i16, y: i16, smooth: bool) -> Result<(), String> {
         let Some(glide) = self.glide.as_ref() else {
             return self.fake(MOTION_NOTIFY, 0, x, y);
         };
 
-        let mut p = glide.state.lock().unwrap();
-        p.target = (x, y);
-
-        if smooth {
-            return Ok(());
+        {
+            let mut p = glide.state.lock().unwrap();
+            p.target = (x as f64, y as f64);
+            if !smooth {
+                p.pos = (x as f64, y as f64);
+                p.vel = (0.0, 0.0);
+                p.last_move = (x, y);
+            }
         }
 
-        p.pos = (x, y);
-        self.conn
-            .xtest_fake_input(MOTION_NOTIFY, 0, x11rb::CURRENT_TIME, self.root, x, y, 0)
-            .map(|_| ())
-            .map_err(|e| format!("fake input: {e}"))?;
-        self.conn.flush().map_err(|e| format!("flush: {e}"))
+        if smooth {
+            Ok(())
+        } else {
+            self.fake(MOTION_NOTIFY, 0, x, y)?;
+            self.conn.flush().map_err(|e| format!("flush: {e}"))
+        }
     }
 
     /// The position of the pointer on the root window.
@@ -355,14 +358,6 @@ fn keysym_of(ch: char) -> u32 {
     }
 }
 
-/// One step to move a `delta`.
-fn step(delta: i16, f: f64) -> i16 {
-    match (delta as f64 * f).round() as i16 {
-        0 if delta != 0 => delta.signum(),
-        s => s,
-    }
-}
-
 /// One frame, from the mode driving the fastest enabled CRTC.
 fn frame(conn: &RustConnection, root: Window) -> Option<Duration> {
     let resources = conn.randr_get_screen_resources(root).ok()?.reply().ok()?;
@@ -390,10 +385,11 @@ fn frame(conn: &RustConnection, root: Window) -> Option<Duration> {
     (fastest > 0.0).then(|| Duration::from_secs_f64(1.0 / fastest))
 }
 
-/// A pointer position and the target it's easing towards.
 struct Pointer {
-    pos: (i16, i16),
-    target: (i16, i16),
+    pos: (f64, f64),
+    vel: (f64, f64),
+    target: (f64, f64),
+    last_move: (i16, i16),
 }
 
 /// A thread easing the pointer towards each new target.
@@ -405,7 +401,12 @@ struct Glide {
 
 impl Glide {
     fn start(root: Window, tick: Duration, pos: (i16, i16)) -> Self {
-        let state = Arc::new(Mutex::new(Pointer { pos, target: pos }));
+        let state = Arc::new(Mutex::new(Pointer {
+            pos: (pos.0 as f64, pos.1 as f64),
+            vel: (0.0, 0.0),
+            target: (pos.0 as f64, pos.1 as f64),
+            last_move: pos,
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let state = state.clone();
@@ -430,42 +431,76 @@ impl Drop for Glide {
     }
 }
 
-/// Step the pointer towards its target once per frame.
+/// Move the pointer towards its target once per frame.
 fn ease(root: Window, tick: Duration, state: Arc<Mutex<Pointer>>, stop: Arc<AtomicBool>) {
     let Ok((conn, _)) = x11rb::connect(None) else {
         eprintln!("ease: no connection");
         return;
     };
+
+    // parameters
+    let omega = 60.0;
+    let zeta = 0.90;
+    let k = omega * omega;
+    let c = 2.0 * zeta * omega;
+
+    let pos_threshold = 0.2;
+    let vel_threshold = 10.0;
+
     let mut last = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         sleep(tick);
         let now = Instant::now();
-        // A stalled thread must not make the pointer jump.
-        let dt = (now - last).min(tick);
+        let dt = (now - last).min(Duration::from_millis(25)).as_secs_f64();
         last = now;
 
         let mut p = state.lock().unwrap();
-        let (dx, dy) = (p.target.0 - p.pos.0, p.target.1 - p.pos.1);
-        if dx == 0 && dy == 0 {
+
+        let dx = p.target.0 - p.pos.0;
+        let dy = p.target.1 - p.pos.1;
+
+        if dx.abs() < pos_threshold
+            && dy.abs() < pos_threshold
+            && p.vel.0.abs() < vel_threshold
+            && p.vel.1.abs() < vel_threshold
+        {
+            p.pos = p.target;
+            p.vel = (0.0, 0.0);
+            let x = p.pos.0 as i16;
+            let y = p.pos.1 as i16;
+            if (x, y) != p.last_move {
+                let _ = conn
+                    .xtest_fake_input(MOTION_NOTIFY, 0, x11rb::CURRENT_TIME, root, x, y, 0)
+                    .map(|_| ())
+                    .map_err(|e| eprintln!("fake input: {e}"));
+                let _ = conn.flush();
+                p.last_move = (x, y);
+            }
             continue;
         }
 
-        let f = 1.0 - (-(dt.as_secs_f64() / TYPE_DELAY.as_secs_f64())).exp();
-        p.pos = (p.pos.0 + step(dx, f), p.pos.1 + step(dy, f));
-        let _ = conn
-            .xtest_fake_input(
-                MOTION_NOTIFY,
-                0,
-                x11rb::CURRENT_TIME,
-                root,
-                p.pos.0,
-                p.pos.1,
-                0,
-            )
-            .map(|_| ())
-            .map_err(|e| format!("fake input: {e}"));
-        let _ = conn.flush();
+        let ax = k * dx - c * p.vel.0;
+        let ay = k * dy - c * p.vel.1;
+
+        p.vel.0 += ax * dt;
+        p.vel.1 += ay * dt;
+
+        p.pos.0 += p.vel.0 * dt;
+        p.pos.1 += p.vel.1 * dt;
+
+        let x = p.pos.0 as i16;
+        let y = p.pos.1 as i16;
+
+        // Only send an event if the integer coordinate has actually changed.
+        if (x, y) != p.last_move {
+            let _ = conn
+                .xtest_fake_input(MOTION_NOTIFY, 0, x11rb::CURRENT_TIME, root, x, y, 0)
+                .map(|_| ())
+                .map_err(|e| eprintln!("fake input: {e}"));
+            let _ = conn.flush();
+            p.last_move = (x, y);
+        }
     }
 }
 
