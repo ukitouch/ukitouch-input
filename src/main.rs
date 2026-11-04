@@ -33,7 +33,7 @@ async fn main() {
     protocol::register(&out).await;
 
     let state = State::default();
-    let mut lines: tokio::io::Lines<BufReader<tokio::io::Stdin>> = BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<protocol::Incoming>(&line) else {
             continue;
