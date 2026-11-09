@@ -2,7 +2,5 @@
   "publisher": "ukitouch",
   "name": "input",
   "version": "0.1.0",
-  "kind": "native",
-  "entry": "ukitouch-input.exe",
-  "platforms": ["linux"]
+  "kind": "native"
 }
