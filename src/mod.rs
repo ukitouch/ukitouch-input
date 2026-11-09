@@ -1,4 +1,4 @@
-//! TODO: Currently only x11 implemented.
+//! TODO: Currently only x11 and Windows implemented.
 
 use serde::Deserialize;
 
@@ -9,7 +9,7 @@ pub struct Point {
     pub y: i16,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MouseButton {
     Left,
@@ -65,9 +65,13 @@ pub trait InputBackend: Send {
 pub fn create() -> Result<Box<dyn InputBackend>, String> {
     #[cfg(all(unix, not(target_os = "android")))]
     {
-        return x11::X11Input::new().map(|b| Box::new(b) as Box<dyn InputBackend>);
+        x11::X11Input::new().map(|b| Box::new(b) as Box<dyn InputBackend>)
     }
-    #[cfg(not(all(unix, not(target_os = "android"))))]
+    #[cfg(windows)]
+    {
+        windows::WindowsInput::new().map(|b| Box::new(b) as Box<dyn InputBackend>)
+    }
+    #[cfg(not(any(all(unix, not(target_os = "android")), windows)))]
     {
         Err(format!("no input backend for {}", std::env::consts::OS))
     }
@@ -75,3 +79,6 @@ pub fn create() -> Result<Box<dyn InputBackend>, String> {
 
 #[cfg(all(unix, not(target_os = "android")))]
 pub mod x11;
+
+#[cfg(windows)]
+pub mod windows;

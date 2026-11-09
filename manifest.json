@@ -3,6 +3,6 @@
   "name": "input",
   "version": "0.1.0",
   "kind": "native",
-  "entry": "ukitouch-input",
+  "entry": "ukitouch-input.exe",
   "platforms": ["linux"]
 }
