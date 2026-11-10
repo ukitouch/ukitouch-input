@@ -32,7 +32,6 @@ struct ConfigureInput {
 #[tokio::main]
 async fn main() {
     let out = protocol::stdout();
-    protocol::register(&out).await;
 
     let state = State::default();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
